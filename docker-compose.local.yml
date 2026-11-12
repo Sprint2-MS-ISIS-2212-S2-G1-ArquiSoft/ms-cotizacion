@@ -1,0 +1,73 @@
+# Solo para desarrollo local. El despliegue real (docker-compose por nodo EC2)
+# vive en el repositorio paraguas.
+services:
+  cotizacion:
+    build: .
+    container_name: cotizacion
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: cotizacion
+      DB_PASSWORD: cotizacion
+      DB_NAME: cotizacion
+      DB_LOGGING: "false"
+      TERCEROS_URL: http://terceros-mock:3000
+    ports:
+      - "3005:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      terceros-mock:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: cotizacion-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cotizacion
+      POSTGRES_USER: cotizacion
+      POSTGRES_PASSWORD: cotizacion
+    ports:
+      - "5435:5432"
+    volumes:
+      - cotizacion_postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cotizacion -d cotizacion"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Doble de prueba del microservicio terceros: implementa el contrato
+  # POST /open-data/scores -> { score } del README de ms-terceros y devuelve
+  # siempre 50, para que las primas calculadas sean deterministas. Detener
+  # este contenedor es la forma de probar el 503 de Open Data.
+  terceros-mock:
+    image: node:20-alpine
+    container_name: cotizacion-terceros-mock
+    restart: unless-stopped
+    command:
+      - node
+      - -e
+      - |
+        require('http')
+          .createServer((req, res) => {
+            res.setHeader('Content-Type', 'application/json');
+            if (req.method === 'POST' && req.url === '/open-data/scores') {
+              req.on('data', () => {});
+              req.on('end', () => res.end(JSON.stringify({ score: 50 })));
+              return;
+            }
+            res.statusCode = 404;
+            res.end(JSON.stringify({ statusCode: 404, message: 'Not Found' }));
+          })
+          .listen(3000);
+    ports:
+      - "3007:3000"
+
+volumes:
+  cotizacion_postgres_data:

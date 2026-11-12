@@ -1,0 +1,6 @@
+export enum EstadoCotizacion {
+  PENDIENTE = 'PENDIENTE',
+  ACEPTADA = 'ACEPTADA',
+  RECHAZADA = 'RECHAZADA',
+  EXPIRADA = 'EXPIRADA',
+}
