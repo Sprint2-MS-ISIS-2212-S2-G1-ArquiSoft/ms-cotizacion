@@ -21,7 +21,7 @@ import { HealthModule } from './health/health.module';
         password: config.get<string>('DB_PASSWORD', 'cotizacion'),
         database: config.get<string>('DB_NAME', 'cotizacion'),
         autoLoadEntities: true,
-        // true por defecto (local, como antes). En AWS: DB_SYNCHRONIZE=false y
+        // En AWS DB_SYNCHRONIZE=false y
         // el esquema lo crea database/init.sql contra la RDS.
         synchronize: config.get<string>('DB_SYNCHRONIZE', 'true') === 'true',
         logging: config.get<string>('DB_LOGGING') === 'true',
@@ -30,9 +30,8 @@ import { HealthModule } from './health/health.module';
           config.get<string>('DB_SSL') === 'true'
             ? { rejectUnauthorized: false }
             : false,
-        // Tactica de dimensionamiento del pool: conexiones POR REPLICA.
-        // replicas maximas de asg-cotizacion x DB_POOL_MAX <= max_connections
-        // de la RDS (db.t3.micro ~ 80).
+        // tactica de dimensionamiento del pool conexiones por replica
+        // replicas maximas de asg-cotizacion * DB_POOL_MAX <= max_connections
         extra: { max: Number(config.get<string>('DB_POOL_MAX', '10')) },
       }),
     }),
