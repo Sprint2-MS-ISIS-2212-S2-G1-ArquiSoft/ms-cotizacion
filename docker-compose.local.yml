@@ -15,10 +15,14 @@ services:
       DB_NAME: cotizacion
       DB_LOGGING: "false"
       TERCEROS_URL: http://terceros-mock:3000
+      REDIS_URL: redis://redis:6379
+      RESILIENCIA_HABILITADA: "${RESILIENCIA_HABILITADA:-true}"
     ports:
       - "3005:3000"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       terceros-mock:
         condition: service_started
@@ -42,10 +46,24 @@ services:
       timeout: 5s
       retries: 10
 
+  # Redis propio de Cotizacion: cache del ultimo score de Open Data (ASR de disponibilidad).
+  redis:
+    image: redis:7-alpine
+    container_name: cotizacion-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # Doble de prueba del microservicio terceros: implementa el contrato
   # POST /open-data/scores -> { score } del README de ms-terceros y devuelve
   # siempre 50, para que las primas calculadas sean deterministas. Detener
-  # este contenedor es la forma de probar el 503 de Open Data.
+  # este contenedor simula la caida de Open Data: con RESILIENCIA_HABILITADA=true
+  # la cotizacion sale con el score en cache o el de defecto; con false, 503.
   terceros-mock:
     image: node:20-alpine
     container_name: cotizacion-terceros-mock

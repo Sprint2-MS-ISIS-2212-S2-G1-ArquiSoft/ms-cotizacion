@@ -16,6 +16,7 @@ import { ActualizarEstadoDto } from './dtos/actualizar-estado.dto';
 import { CrearCotizacionDto } from './dtos/crear-cotizacion.dto';
 import { ListarCotizacionesQueryDto } from './dtos/listar-cotizaciones.query.dto';
 import { Cotizacion } from './entities/cotizacion.entity';
+import { OrigenScore } from '../resiliencia/open-data-score.service';
 
 @Controller()
 export class CotizacionController {
@@ -30,7 +31,7 @@ export class CotizacionController {
   crearCotizacion(
     @Body() dto: CrearCotizacionDto,
     @Headers('x-socio-id') socioId?: string,
-  ): Promise<Cotizacion> {
+    ): Promise<Cotizacion & { origenScore: OrigenScore | null }> {
     if (!socioId || !isUUID(socioId)) {
       throw new BadRequestException('Header X-Socio-Id requerido');
     }

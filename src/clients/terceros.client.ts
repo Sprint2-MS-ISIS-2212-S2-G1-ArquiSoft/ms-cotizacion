@@ -1,44 +1,41 @@
-import {
-  Injectable,
-  Logger,
-  ServiceUnavailableException,
-} from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Agent, fetch } from 'undici';
 
-/** Timeout de toda llamada saliente hacia Terceros (regla 5 de CLAUDE.md). */
-const TIMEOUT_MS = 5000;
+
+const TIMEOUT_SIN_TACTICAS_MS = 5000;
 
 interface RespuestaScore {
   score: number;
 }
 
-/**
- * Cliente HTTP hacia el microservicio terceros.
- *
- * En el monolito esto era una llamada en proceso a
- * TercerosService.getOpenDataScore(). Los reintentos, el backoff y el circuit
- * breaker (opossum) que ese mock traia NO se migran, y tampoco se guarda el
- * ultimo score en cache: son tacticas del ASR de Cotizacion y se agregan en
- * su propia rama. Aqui solo queda el timeout, que es obligatorio, y la
- * propagacion de X-Socio-Id.
- */
+
+export class TercerosNoDisponibleError extends Error {}
+
+
 @Injectable()
-export class TercerosClient {
+export class TercerosClient implements OnModuleDestroy {
   private readonly logger = new Logger(TercerosClient.name);
+  private readonly poolTerceros: Agent;
+  readonly timeoutMs: number;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(private readonly config: ConfigService) {
+    const resiliencia =
+      this.config.get<string>('RESILIENCIA_HABILITADA', 'true') === 'true';
+    this.timeoutMs = resiliencia
+      ? Number(this.config.get<string>('TERCEROS_TIMEOUT_MS', '300'))
+      : TIMEOUT_SIN_TACTICAS_MS;
 
-  /**
-   * Consulta el score de Open Data del documento (entero 0-100).
-   *
-   * A diferencia del KYC, aqui no hay respuesta de negocio negativa: si
-   * Terceros no contesta o contesta con error, no hay score con el que
-   * cotizar, asi que todo fallo se traduce a 503.
-   */
+    this.poolTerceros = new Agent({
+      connections: Number(this.config.get<string>('BULKHEAD_CONEXIONES', '20')),
+      keepAliveTimeout: 30_000,
+    });
+  }
+
   async obtenerScore(documento: string, socioId?: string): Promise<number> {
     const baseUrl = this.config.get<string>('TERCEROS_URL');
     if (!baseUrl) {
-      throw new ServiceUnavailableException('Servicio Open Data no disponible');
+      throw new TercerosNoDisponibleError('Falta TERCEROS_URL');
     }
 
     const headers: Record<string, string> = {
@@ -48,30 +45,31 @@ export class TercerosClient {
       headers['X-Socio-Id'] = socioId;
     }
 
-    let respuesta: Response;
+    let respuesta: Awaited<ReturnType<typeof fetch>>;
     try {
       respuesta = await fetch(`${baseUrl}/open-data/scores`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ documento }),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
+        signal: AbortSignal.timeout(this.timeoutMs),
+        dispatcher: this.poolTerceros,
       });
     } catch (error) {
-      // Timeout o conexion rechazada: Terceros no respondio.
-      this.logger.error(
-        `Terceros no respondio al consultar el score: ${String(error)}`,
-      );
-      throw new ServiceUnavailableException('Servicio Open Data no disponible');
+      this.logger.warn(`Terceros no respondio: ${String(error)}`);
+      throw new TercerosNoDisponibleError(String(error));
     }
 
     if (!respuesta.ok) {
-      this.logger.error(
-        `Terceros respondio ${respuesta.status} al consultar el score`,
-      );
-      throw new ServiceUnavailableException('Servicio Open Data no disponible');
+      await respuesta.text().catch(() => undefined);
+      this.logger.warn(`Terceros respondio ${respuesta.status}`);
+      throw new TercerosNoDisponibleError(`HTTP ${respuesta.status}`);
     }
 
     const cuerpo = (await respuesta.json()) as RespuestaScore;
     return cuerpo.score;
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.poolTerceros.close();
   }
 }
