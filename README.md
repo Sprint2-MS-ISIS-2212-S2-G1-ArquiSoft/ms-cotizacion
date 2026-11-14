@@ -283,4 +283,73 @@ Data) se implementa en su propia rama. De este andamio están
 - circuit breaker y reintentos con backoff (el mock del monolito los tenía con
   `opossum`; aquí solo queda el timeout de 5 s, que es obligatorio);
 - autoescalado del ASG, mTLS, rate limiting e idempotencia;
-- filtrado de cotizaciones por pertenencia del socio.
+- ~~filtrado de cotizaciones por pertenencia del socio~~ → **ya implementado**,
+  ver [ASR de seguridad](#asr-de-seguridad).
+
+## ASR de seguridad
+
+> *Aislamiento y autorización por alcance en la API de socios* (Martín).
+> Un socio bien autenticado no puede leer ni modificar recursos de otro socio:
+> el sistema responde `403` y **no devuelve datos del otro socio**.
+
+Este servicio es el **dueño del dato** y por eso es él quien decide la
+pertenencia, no el borde. Esa es la parte de **defensa en profundidad** del ASR:
+comprometer el gateway o Distribución no alcanza para leer la cotización de otro
+socio, porque la comparación vuelve a hacerse aquí.
+
+```bash
+# desde dentro de la red, saltándose gateway Y Distribución:
+# la cotización 174022 es del socio B, el header dice socio A -> 403
+docker compose exec -T distribucion wget -S -qO- \
+  --header 'X-Socio-Id: 123e4567-e89b-12d3-a456-426614174001' \
+  http://cotizacion:3000/cotizaciones/123e4567-e89b-12d3-a456-426614174022
+```
+
+### Dónde está cada táctica
+
+| Táctica | Dónde |
+|---|---|
+| Autorización por recurso (pertenencia del socio) | [`src/cotizacion/cotizacion.service.ts:90`](src/cotizacion/cotizacion.service.ts#L90) `verificarPertenencia()` |
+| `X-Socio-Id` obligatorio en todas las rutas | [`src/cotizacion/cotizacion.controller.ts:41`](src/cotizacion/cotizacion.controller.ts#L41) `exigirSocio()` |
+| Listado filtrado por socio | [`src/cotizacion/cotizacion.service.ts:125`](src/cotizacion/cotizacion.service.ts#L125) `listarCotizaciones()` |
+| Sin fuga de datos en el `403` | [`src/cotizacion/cotizacion.service.ts:27`](src/cotizacion/cotizacion.service.ts#L27) literal `NO_AUTORIZADO` |
+| Datos semilla por socio (A, B, C) | [`database/init.sql:133`](database/init.sql#L133) |
+| mTLS y cifrado en tránsito | `solventa-infra/gateway/nginx.conf` (el socio nunca llega aquí directo) |
+| Autorización por alcance (scopes) y audit log | `ms-distribucion` (`validador-socio/`) |
+
+### Cambios de contrato
+
+`X-Socio-Id` pasa a ser **obligatorio en las cinco rutas de cotizaciones**, no
+solo en `POST /cotizaciones`. Si falta o no es un uuid →
+`400 'Header X-Socio-Id requerido'`. Sin el header no hay forma de decidir la
+pertenencia, así que atender la petición sería justamente la fuga que este ASR
+cierra.
+
+| Ruta | Antes | Ahora |
+|---|---|---|
+| `POST /cotizaciones` | `400` si falta el header | igual |
+| `GET /cotizaciones?clienteId=` | devolvía las cotizaciones de **todos** los socios | header obligatorio; filtra por socio (+ `clienteId` opcional) |
+| `GET /cotizaciones/:id` | header ignorado | header obligatorio; `404` si no existe, `403` si es de otro socio |
+| `PATCH /cotizaciones/:id/estado` | header ignorado | header obligatorio; `403` si es de otro socio |
+| `POST /cotizaciones/:id/validacion` | header ignorado | header obligatorio; `403` si es de otro socio, **antes** de marcarla `EXPIRADA` |
+
+En `validacion` el orden importa: el chequeo de vigencia tiene efecto de
+escritura (`PENDIENTE → EXPIRADA`), así que la pertenencia se verifica primero
+para que un socio ajeno no pueda provocar ese cambio de estado. Es también lo
+que convierte *"suscribir una cotización ajena"* en un `403`, porque
+`POST /suscribir` de Distribución empieza llamando a esta ruta.
+
+### Datos semilla del ASR
+
+Además de las dos cotizaciones del socio A (`…174020`, `…174021`):
+
+| Id | Socio | Estado | Para qué |
+|---|---|---|---|
+| [`123e4567-…-426614174022`](database/init.sql#L120) | B | `PENDIENTE` | recurso ajeno: el socio A pide este id y recibe `403` |
+| `a0000000-0000-4000-8000-000000000001` … `-000000000100` | A | `PENDIENTE` | 100 por socio, ids deterministas, para medir con volumen real |
+| `b0000000-0000-4000-8000-000000000001` … `-000000000100` | B | `PENDIENTE` | idem |
+| `c0000000-0000-4000-8000-000000000001` … `-000000000100` | C | `PENDIENTE` | idem |
+
+Los 300 se generan con `generate_series` en
+[`database/init.sql:133`](database/init.sql#L133), más un índice sobre
+`"socioDistribucionId"`, que es el camino caliente de toda lectura.

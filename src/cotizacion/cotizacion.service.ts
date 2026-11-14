@@ -1,6 +1,8 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -14,8 +16,20 @@ import { CrearCotizacionDto } from './dtos/crear-cotizacion.dto';
 import { Cotizacion } from './entities/cotizacion.entity';
 import { EstadoCotizacion } from './enums/estado-cotizacion.enum';
 
+/**
+ * ASR de seguridad (Martin) · aislamiento por socio.
+ *
+ * Mensaje unico de rechazo por pertenencia. Es un literal fijo a proposito: no
+ * menciona el id, ni el socio dueno, ni ningun campo de la cotizacion ajena.
+ * El socio que recibe el 403 no debe poder deducir nada del recurso que
+ * intento tocar (ni siquiera si existe o de quien es).
+ */
+const NO_AUTORIZADO = 'No autorizado para este recurso';
+
 @Injectable()
 export class CotizacionService {
+  private readonly logger = new Logger(CotizacionService.name);
+
   constructor(
     @InjectRepository(Cotizacion)
     private readonly cotizacionRepository: Repository<Cotizacion>,
@@ -66,7 +80,26 @@ export class CotizacionService {
     return Object.assign(guardada, { origenScore });
   }
 
-  async getCotizacion(idCotizacion: string): Promise<Cotizacion> {
+  /**
+   * ASR de seguridad (Martin): la cotizacion es del socio que la pidio o no se
+   * entrega. Este es el unico sitio que decide la pertenencia, y lo hace el
+   * servicio DUENO del dato, no el borde: por eso saltarse el gateway y
+   * Distribucion y pegarle directo a Cotizacion desde dentro de la red tampoco
+   * sirve para leer la cotizacion de otro socio (defensa en profundidad).
+   */
+  private verificarPertenencia(cotizacion: Cotizacion, socioId: string): void {
+    if (cotizacion.socioDistribucionId !== socioId) {
+      this.logger.warn(
+        `Socio ${socioId} intento acceder a la cotizacion ${cotizacion.id}, que no es suya`,
+      );
+      throw new ForbiddenException(NO_AUTORIZADO);
+    }
+  }
+
+  async getCotizacion(
+    idCotizacion: string,
+    socioId: string,
+  ): Promise<Cotizacion> {
 
     if (!isUUID(idCotizacion)) {
       throw new NotFoundException(
@@ -81,18 +114,32 @@ export class CotizacionService {
         `Cotizacion con id ${idCotizacion} no encontrada`,
       );
     }
+    this.verificarPertenencia(cotizacion, socioId);
     return cotizacion;
   }
 
-  async listarCotizaciones(clienteId?: string): Promise<Cotizacion[]> {
+  /**
+   * ASR de seguridad (Martin): filtra siempre por el socio del header. El
+   * clienteId sigue siendo un filtro opcional ADEMAS de ese, no en su lugar.
+   */
+  async listarCotizaciones(
+    socioId: string,
+    clienteId?: string,
+  ): Promise<Cotizacion[]> {
     return this.cotizacionRepository.find({
-      where: clienteId ? { clienteId } : {},
+      where: {
+        socioDistribucionId: socioId,
+        ...(clienteId ? { clienteId } : {}),
+      },
       order: { fechaEmision: 'DESC' },
     });
   }
 
 
-  async validarCotizacion(idCotizacion: string): Promise<Cotizacion> {
+  async validarCotizacion(
+    idCotizacion: string,
+    socioId: string,
+  ): Promise<Cotizacion> {
 
     if (!isUUID(idCotizacion)) {
       throw new BadRequestException('Cotización inválida o expirada');
@@ -105,6 +152,13 @@ export class CotizacionService {
     if (!cotizacion) {
       throw new BadRequestException('Cotización inválida o expirada');
     }
+
+    // ASR de seguridad (Martin): la pertenencia se comprueba ANTES del
+    // chequeo de vigencia, que tiene efecto de escritura (PENDIENTE ->
+    // EXPIRADA). Un socio ajeno no debe poder provocar ese cambio de estado en
+    // la cotizacion de otro. Es tambien lo que convierte el "suscribir una
+    // cotizacion ajena" de Distribucion en un 403.
+    this.verificarPertenencia(cotizacion, socioId);
 
     if (!cotizacion.estaVigente()) {
 
@@ -122,8 +176,11 @@ export class CotizacionService {
   async actualizarEstado(
     idCotizacion: string,
     estado: EstadoCotizacion,
+    socioId: string,
   ): Promise<Cotizacion> {
-    const cotizacion = await this.getCotizacion(idCotizacion);
+    // getCotizacion ya valida la pertenencia: nadie cambia el estado de una
+    // cotizacion que no es suya.
+    const cotizacion = await this.getCotizacion(idCotizacion, socioId);
     cotizacion.estado = estado;
     return this.cotizacionRepository.save(cotizacion);
   }
